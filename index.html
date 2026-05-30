@@ -178,6 +178,7 @@
   <div id="hud">
     <span class="badge" id="ref-badge">No reference — take first photo</span>
     <span class="badge" id="dist-badge" style="display:none"></span>
+    <span class="badge" id="folder-badge">Saving to Downloads</span>
   </div>
 
   <div id="flash"></div>
@@ -195,6 +196,7 @@
   <div class="btn-col">
     <button class="ctrl-btn primary" id="set-ref-btn" style="display:none">Use as ref</button>
     <button class="ctrl-btn" id="reset-btn" style="display:none">Reset ref</button>
+    <button class="ctrl-btn" id="folder-btn">Set folder</button>
   </div>
 </div>
 
@@ -242,6 +244,7 @@ let refFaceSize   = null;      // px diagonal of face bounding box at reference 
 let lastBlob      = null;      // most recently captured photo
 let faceDetector  = null;
 let liveFaceSize  = null;
+let dirHandle     = null;      // FileSystemDirectoryHandle for the save folder
 
 // ─── Camera ──────────────────────────────────────────────────────────────────
 async function startCamera() {
@@ -409,6 +412,8 @@ document.getElementById('set-ref-btn').addEventListener('click', async () => {
   toast('Ghost updated to latest photo');
 });
 
+document.getElementById('folder-btn').addEventListener('click', pickFolder);
+
 document.getElementById('reset-btn').addEventListener('click', async () => {
   if (!confirm('Clear the ghost overlay?\nThe next photo you take will become the new reference.')) return;
   referenceBlob = null; refFaceSize = null;
@@ -420,21 +425,85 @@ document.getElementById('reset-btn').addEventListener('click', async () => {
 
 // ─── Save to device ───────────────────────────────────────────────────────────
 //
-// Triggers a browser download — on Android Chrome this lands in the Downloads
-// folder. Enable "Downloads" backup in Google Photos settings to sync them.
+// Tries to write directly into the chosen folder via the File System Access API.
+// Falls back to a plain browser download (→ Downloads/) if the API is missing
+// or the user never picked a folder.
 //
-function saveToDevice(blob) {
-  const d    = new Date();
-  const pad  = n => String(n).padStart(2, '0');
-  const name = `baby-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`
-             + `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.jpg`;
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
+function makeFilename() {
+  const d   = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `baby-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`
+       + `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.jpg`;
+}
+
+async function saveToDevice(blob) {
+  const name = makeFilename();
+
+  if (dirHandle) {
+    try {
+      // Re-verify permission (it can lapse after the phone screen locks).
+      let perm = await dirHandle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        perm = await dirHandle.requestPermission({ mode: 'readwrite' });
+      }
+      if (perm === 'granted') {
+        const fh = await dirHandle.getFileHandle(name, { create: true });
+        const w  = await fh.createWritable();
+        await w.write(blob);
+        await w.close();
+        updateFolderBadge();
+        return;
+      }
+    } catch (err) {
+      console.warn('Folder write failed, falling back to download:', err);
+    }
+  }
+
+  // Fallback: regular browser download → Downloads/
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement('a');
   a.href = url; a.download = name;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// ─── Folder picker ────────────────────────────────────────────────────────────
+//
+// Called by the "Set folder" button. Lets the user pick (or create) a folder
+// once; the handle is persisted in IndexedDB so it survives app restarts.
+// On Android Chrome the picker opens the system file browser where the user
+// can navigate to Pictures and create a "Baby Timelapse" folder.
+//
+async function pickFolder() {
+  if (!('showDirectoryPicker' in window)) {
+    toast('Folder picker not supported — photos go to Downloads');
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker({
+      mode: 'readwrite',
+      startIn: 'pictures',
+    });
+    dirHandle = handle;
+    await dbPut('dirHandle', handle);
+    updateFolderBadge();
+    toast(`Saving to: ${handle.name}`);
+  } catch (err) {
+    if (err.name !== 'AbortError') toast('Could not open folder: ' + err.message);
+  }
+}
+
+function updateFolderBadge() {
+  const badge = document.getElementById('folder-badge');
+  if (dirHandle) {
+    badge.textContent = `📁 ${dirHandle.name}`;
+    badge.className   = 'badge ok';
+  } else {
+    badge.textContent = 'Saving to Downloads';
+    badge.className   = 'badge';
+  }
 }
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -471,8 +540,10 @@ function toast(msg) {
 
   referenceBlob = await dbGet('ref');
   refFaceSize   = await dbGet('refFaceSize') || null;
+  dirHandle     = await dbGet('dirHandle') || null;
   drawOverlay();
   updateUI();
+  updateFolderBadge();
 
   try {
     await startCamera();
