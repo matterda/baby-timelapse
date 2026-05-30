@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0f0f1a">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Baby Timelapse</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0f0f1a;
+      color: #fff;
+      font-family: system-ui, -apple-system, sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      touch-action: none;
+    }
+
+    #viewport {
+      position: relative;
+      flex: 1;
+      overflow: hidden;
+      background: #000;
+    }
+
+    #video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    /* overlay drawn in a canvas that sits exactly on top of the video */
+    #overlay-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      /* canvas logical size is set in JS to match video display pixels */
+    }
+
+    /* HUD badges across the top */
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 0; right: 0;
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      pointer-events: none;
+      flex-wrap: wrap;
+      padding: 0 8px;
+    }
+
+    .badge {
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(4px);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid rgba(255,255,255,0.2);
+      white-space: nowrap;
+    }
+    .badge.ok   { border-color: #4caf50; color: #81c784; }
+    .badge.warn { border-color: #ff9800; color: #ffb74d; }
+    .badge.err  { border-color: #f44336; color: #e57373; }
+
+    /* camera-flash feedback */
+    #flash {
+      position: absolute;
+      inset: 0;
+      background: #fff;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 80ms ease-out;
+    }
+    #flash.fire { opacity: 0.85; }
+
+    /* bottom control bar */
+    #controls {
+      padding: 14px 20px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #0f0f1a;
+      gap: 12px;
+    }
+
+    /* shutter */
+    #capture-btn {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      background: #fff;
+      border: 4px solid rgba(255,255,255,0.35);
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: transform 80ms;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #capture-btn:active { transform: scale(0.90); }
+
+    /* ghost opacity slider */
+    .slider-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      min-width: 80px;
+    }
+    .slider-wrap label {
+      font-size: 11px;
+      color: rgba(255,255,255,0.55);
+      letter-spacing: .03em;
+    }
+    #opacity-slider {
+      width: 80px;
+      accent-color: #90caf9;
+    }
+
+    /* small action buttons */
+    .btn-col {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: flex-end;
+    }
+    .ctrl-btn {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.18);
+      color: #fff;
+      border-radius: 10px;
+      padding: 7px 13px;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .ctrl-btn:active { opacity: 0.6; }
+    .ctrl-btn.primary {
+      border-color: #90caf9;
+      color: #90caf9;
+    }
+
+    /* toast */
+    #toast {
+      position: absolute;
+      bottom: 90px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(6px);
+      border-radius: 20px;
+      padding: 8px 18px;
+      font-size: 13px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 300ms;
+      white-space: nowrap;
+    }
+    #toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+
+<div id="viewport">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay-canvas"></canvas>
+
+  <div id="hud">
+    <span class="badge" id="ref-badge">No reference — take first photo</span>
+    <span class="badge" id="dist-badge" style="display:none"></span>
+  </div>
+
+  <div id="flash"></div>
+  <div id="toast"></div>
+</div>
+
+<div id="controls">
+  <div class="slider-wrap">
+    <label for="opacity-slider">GHOST</label>
+    <input type="range" id="opacity-slider" min="0" max="75" value="38">
+  </div>
+
+  <button id="capture-btn" aria-label="Capture"></button>
+
+  <div class="btn-col">
+    <button class="ctrl-btn primary" id="set-ref-btn" style="display:none">Use as ref</button>
+    <button class="ctrl-btn" id="reset-btn" style="display:none">Reset ref</button>
+  </div>
+</div>
+
+<!-- full-res capture surface, hidden -->
+<canvas id="cap-canvas" style="display:none"></canvas>
+
+<script>
+// ─── IndexedDB ────────────────────────────────────────────────────────────────
+const DB_NAME = 'baby-tl', DB_VER = 1;
+let db;
+
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, DB_VER);
+    r.onupgradeneeded = e => e.target.result.createObjectStore('kv');
+    r.onsuccess = e => res(e.target.result);
+    r.onerror = e => rej(e.target.error);
+  });
+}
+function dbPut(k, v) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').put(v, k);
+    tx.oncomplete = res; tx.onerror = rej;
+  });
+}
+function dbGet(k) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readonly');
+    const r = tx.objectStore('kv').get(k);
+    r.onsuccess = () => res(r.result); r.onerror = rej;
+  });
+}
+function dbDel(k) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').delete(k);
+    tx.oncomplete = res; tx.onerror = rej;
+  });
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let referenceBlob = null;      // the ghost overlay image
+let refFaceSize   = null;      // px diagonal of face bounding box at reference time
+let lastBlob      = null;      // most recently captured photo
+let faceDetector  = null;
+let liveFaceSize  = null;
+
+// ─── Camera ──────────────────────────────────────────────────────────────────
+async function startCamera() {
+  const video = document.getElementById('video');
+  // Prefer back camera; request maximum resolution for full-quality saves.
+  // On Pixel 8a the rear sensor supports 4032×3024.
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: { ideal: 'environment' },
+      width:  { ideal: 4032 },
+      height: { ideal: 3024 },
+    },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+// ─── Overlay ─────────────────────────────────────────────────────────────────
+//
+// We draw the reference image onto a canvas that covers the <video> element.
+// To match object-fit:cover we replicate the "cover" math in canvas.
+//
+function drawOverlay() {
+  const canvas = document.getElementById('overlay-canvas');
+  const video  = document.getElementById('video');
+  const ctx    = canvas.getContext('2d');
+
+  // Match the canvas's *logical* pixels to the CSS size of the video element
+  // so our drawing coordinates line up with what the user sees.
+  const rect = video.getBoundingClientRect();
+  const dpr  = window.devicePixelRatio || 1;
+  const cw   = rect.width  * dpr;
+  const ch   = rect.height * dpr;
+
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width  = cw;
+    canvas.height = ch;
+    canvas.style.width  = rect.width  + 'px';
+    canvas.style.height = rect.height + 'px';
+  }
+
+  ctx.clearRect(0, 0, cw, ch);
+  if (!referenceBlob) return;
+
+  const opacity = document.getElementById('opacity-slider').value / 100;
+  const img = new Image();
+  const url = URL.createObjectURL(referenceBlob);
+
+  img.onload = () => {
+    // Replicate object-fit:cover: fill the canvas, crop the overflow.
+    const scale = Math.max(cw / img.width, ch / img.height);
+    const w = img.width  * scale;
+    const h = img.height * scale;
+    const x = (cw - w) / 2;
+    const y = (ch - h) / 2;
+
+    ctx.globalAlpha = opacity;
+    ctx.drawImage(img, x, y, w, h);
+    ctx.globalAlpha = 1;
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+
+document.getElementById('opacity-slider').addEventListener('input', drawOverlay);
+window.addEventListener('resize', drawOverlay);
+
+// ─── Face detection (distance proxy) ─────────────────────────────────────────
+//
+// FaceDetector API is available in Chrome on Android.
+// We measure the bounding-box diagonal in the *video stream* (not CSS pixels)
+// and compare to the reference shot's face size.
+// This gives a rough "too close / too far" hint.
+//
+async function initFaceDetection() {
+  if (typeof FaceDetector === 'undefined') return;
+  try {
+    faceDetector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
+    const video = document.getElementById('video');
+    setInterval(async () => {
+      if (!faceDetector || video.readyState < 2) return;
+      try {
+        const faces = await faceDetector.detect(video);
+        if (faces.length) {
+          const b = faces[0].boundingBox;
+          liveFaceSize = Math.hypot(b.width, b.height);
+        } else {
+          liveFaceSize = null;
+        }
+        updateDistBadge();
+      } catch { /* detector not ready yet */ }
+    }, 700);
+  } catch { /* FaceDetector construction failed */ }
+}
+
+function updateDistBadge() {
+  const badge = document.getElementById('dist-badge');
+  if (!liveFaceSize) { badge.style.display = 'none'; return; }
+  badge.style.display = '';
+
+  if (!refFaceSize) {
+    badge.textContent = `Face ${Math.round(liveFaceSize)}px`;
+    badge.className = 'badge';
+    return;
+  }
+
+  const ratio = liveFaceSize / refFaceSize;
+  const pct   = Math.round((ratio - 1) * 100);
+
+  if (Math.abs(pct) < 8) {
+    badge.textContent = '✓ Good distance';
+    badge.className = 'badge ok';
+  } else if (pct > 0) {
+    badge.textContent = `Too close +${pct}%`;
+    badge.className = 'badge warn';
+  } else {
+    badge.textContent = `Too far ${pct}%`;
+    badge.className = 'badge warn';
+  }
+}
+
+// ─── Capture ─────────────────────────────────────────────────────────────────
+document.getElementById('capture-btn').addEventListener('click', async () => {
+  const video  = document.getElementById('video');
+  const canvas = document.getElementById('cap-canvas');
+
+  canvas.width  = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+
+  // Flash feedback
+  const flash = document.getElementById('flash');
+  flash.classList.add('fire');
+  requestAnimationFrame(() => requestAnimationFrame(() => flash.classList.remove('fire')));
+
+  const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.95));
+  lastBlob = blob;
+
+  // First ever photo → auto-set as reference
+  if (!referenceBlob) {
+    await setReference(blob, liveFaceSize);
+    toast('Reference set — align future photos to the ghost');
+  } else {
+    toast('Photo saved — tap "Use as ref" to update the ghost');
+  }
+
+  saveToDevice(blob);
+  updateUI();
+});
+
+// ─── Set / reset reference ───────────────────────────────────────────────────
+async function setReference(blob, faceSize) {
+  referenceBlob = blob;
+  refFaceSize   = faceSize || null;
+  await dbPut('ref', blob);
+  if (faceSize) await dbPut('refFaceSize', faceSize);
+  drawOverlay();
+  updateUI();
+}
+
+document.getElementById('set-ref-btn').addEventListener('click', async () => {
+  if (!lastBlob) return;
+  await setReference(lastBlob, liveFaceSize);
+  toast('Ghost updated to latest photo');
+});
+
+document.getElementById('reset-btn').addEventListener('click', async () => {
+  if (!confirm('Clear the ghost overlay?\nThe next photo you take will become the new reference.')) return;
+  referenceBlob = null; refFaceSize = null;
+  await dbDel('ref'); await dbDel('refFaceSize');
+  drawOverlay();
+  updateUI();
+  toast('Reference cleared');
+});
+
+// ─── Save to device ───────────────────────────────────────────────────────────
+//
+// Triggers a browser download — on Android Chrome this lands in the Downloads
+// folder. Enable "Downloads" backup in Google Photos settings to sync them.
+//
+function saveToDevice(blob) {
+  const d    = new Date();
+  const pad  = n => String(n).padStart(2, '0');
+  const name = `baby-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`
+             + `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.jpg`;
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// ─── UI helpers ───────────────────────────────────────────────────────────────
+function updateUI() {
+  const refBadge  = document.getElementById('ref-badge');
+  const setRefBtn = document.getElementById('set-ref-btn');
+  const resetBtn  = document.getElementById('reset-btn');
+
+  if (referenceBlob) {
+    refBadge.textContent = 'Ghost overlay active';
+    refBadge.className   = 'badge ok';
+    resetBtn.style.display = '';
+  } else {
+    refBadge.textContent = 'No reference — take first photo';
+    refBadge.className   = 'badge';
+    resetBtn.style.display = 'none';
+  }
+
+  setRefBtn.style.display = lastBlob ? '' : 'none';
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+(async () => {
+  db = await openDB();
+
+  referenceBlob = await dbGet('ref');
+  refFaceSize   = await dbGet('refFaceSize') || null;
+  drawOverlay();
+  updateUI();
+
+  try {
+    await startCamera();
+  } catch (err) {
+    toast('Camera error: ' + err.message);
+    return;
+  }
+
+  // Redraw overlay once video dimensions are known
+  document.getElementById('video').addEventListener('loadedmetadata', drawOverlay);
+
+  await initFaceDetection();
+})();
+</script>
+</body>
+</html>
